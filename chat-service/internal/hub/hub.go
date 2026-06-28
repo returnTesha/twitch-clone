@@ -6,7 +6,9 @@ import (
 	"context"
 	"encoding/json"
 	"sync"
+	"time"
 
+	"github.com/redis/go-redis/v9"
 	"github.com/rs/zerolog/log"
 )
 
@@ -29,16 +31,18 @@ type Hub struct {
 	unregister chan *model.Client
 	broadcast  chan *model.Message
 
+	rdb *redis.Client
 	// ingest-service 연동 포인트 (nil이면 스킵)
 	ingestNotifier IngestNotifier
 }
 
-func NewHub(notifier IngestNotifier) *Hub {
+func NewHub(rdb *redis.Client, notifier IngestNotifier) *Hub {
 	return &Hub{
 		channels:       make(map[string]*Channel),
 		register:       make(chan *model.Client, 256),
 		unregister:     make(chan *model.Client, 256),
 		broadcast:      make(chan *model.Message, 512),
+		rdb:            rdb,
 		ingestNotifier: notifier,
 	}
 }
@@ -103,6 +107,17 @@ func (h *Hub) addClient(ctx context.Context, client *model.Client) {
 			}
 		}()
 	}
+
+	h.rdb.ZAdd(ctx, "channel:"+client.ChannelID+":users", redis.Z{
+		Score:  float64(time.Now().Unix()),
+		Member: client.UserID,
+	})
+
+	h.rdb.ZAdd(ctx, "channels:ranking:viewers", redis.Z{
+		Score:  float64(viewerCount),
+		Member: client.ChannelID,
+	})
+
 }
 
 func (h *Hub) removeClient(ctx context.Context, client *model.Client) {
@@ -126,12 +141,21 @@ func (h *Hub) removeClient(ctx context.Context, client *model.Client) {
 		Int("viewer_count", viewerCount).
 		Msg("client left")
 
+	// 유저 제거
+	h.rdb.ZRem(ctx, "channel:"+client.ChannelID+":users", client.UserID)
+
 	// 채널에 아무도 없으면 정리
 	if viewerCount == 0 {
 		h.mu.Lock()
 		delete(h.channels, client.ChannelID)
 		h.mu.Unlock()
 		log.Info().Str("channel_id", client.ChannelID).Msg("channel removed (empty)")
+		h.rdb.ZRem(ctx, "channels:ranking:viewers", client.ChannelID)
+	} else {
+		h.rdb.ZAdd(ctx, "channels:ranking:viewers", redis.Z{
+			Score:  float64(viewerCount),
+			Member: client.ChannelID,
+		})
 	}
 
 	// ingest-service에 시청자 수 변경 알림 (gRPC)
@@ -142,6 +166,26 @@ func (h *Hub) removeClient(ctx context.Context, client *model.Client) {
 			}
 		}()
 	}
+}
+
+// 채널 활성 유저 목록 (입장 순)
+func (h *Hub) ChannelUsers(ctx context.Context, channelID string) []string {
+	result, _ := h.rdb.ZRange(ctx, "channel:"+channelID+":users", 0, -1).Result()
+	return result
+}
+
+// 인기 채널 TOP N
+func (h *Hub) TopChannels(ctx context.Context, n int) []redis.Z {
+	result, _ := h.rdb.ZRevRangeWithScores(ctx, "channels:ranking:viewers", 0, int64(n-1)).Result()
+	return result
+}
+
+func (h *Hub) UserRank(ctx context.Context, channelID, userID string) int64 {
+	rank, err := h.rdb.ZRank(ctx, "channel:"+channelID+":users", userID).Result()
+	if err != nil {
+		return -1
+	}
+	return rank + 1 // 0-based → 1-based
 }
 
 func (h *Hub) broadcastToChannel(msg *model.Message) {

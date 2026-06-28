@@ -46,7 +46,7 @@ func main() {
 	log.Info().Str("addr", cfg.RedisAddr).Msg("redis connected")
 
 	// Hub (ingest-service 붙을 때 nil → gRPC 클라이언트로 교체)
-	h := hub.NewHub(nil)
+	h := hub.NewHub(rdb, nil)
 	go h.Run(ctx)
 
 	// Stream
@@ -88,6 +88,40 @@ func main() {
 		ctx.JSON(http.StatusOK, gin.H{"token": token})
 	})
 
+	// 채널 활성 유저 목록
+	r.GET("/channels/:channelId/users", func(ctx *gin.Context) {
+		channelID := ctx.Param("channelId")
+		users := h.ChannelUsers(ctx.Request.Context(), channelID)
+		ctx.JSON(http.StatusOK, gin.H{
+			"channel_id": channelID,
+			"users":      users,
+			"count":      len(users),
+		})
+	})
+
+	// 인기 채널 TOP 10
+	r.GET("/channels/ranking", func(ctx *gin.Context) {
+		channels := h.TopChannels(ctx.Request.Context(), 10)
+		ctx.JSON(http.StatusOK, gin.H{
+			"ranking": channels,
+		})
+	})
+
+	// 내 입장 순번
+	r.GET("/channels/:channelId/rank/:userId", func(ctx *gin.Context) {
+		channelID := ctx.Param("channelId")
+		userID := ctx.Param("userId")
+		rank := h.UserRank(ctx.Request.Context(), channelID, userID)
+		if rank == -1 {
+			ctx.JSON(http.StatusNotFound, gin.H{"error": "user not in channel"})
+			return
+		}
+		ctx.JSON(http.StatusOK, gin.H{
+			"channel_id": channelID,
+			"user_id":    userID,
+			"rank":       rank,
+		})
+	})
 	// WebSocket
 	ws := r.Group("/ws")
 	ws.Use(jwtManager.Middleware())
